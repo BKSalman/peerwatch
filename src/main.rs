@@ -1,7 +1,7 @@
 use iroh::SecretKey;
 use iroh_gossip::api::Event;
 use n0_future::StreamExt;
-use peer::{PeerPlayTicket, send_mpv_command, wait_until_file_created};
+use peerwatch::{PeerPlayTicket, send_mpv_command, wait_until_file_created};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -136,17 +136,17 @@ async fn main() {
                     break;
                 }
 
-                if let Ok(message) = serde_json::from_str::<peer::mpv::Message>(&read_buf) {
+                if let Ok(message) = serde_json::from_str::<peerwatch::mpv::Message>(&read_buf) {
                     match message {
-                        peer::mpv::Message::Event(event) => {
+                        peerwatch::mpv::Message::Event(event) => {
                             match event {
-                                peer::mpv::events::Event::PropertyChange(property_change) => {
+                                peerwatch::mpv::events::Event::PropertyChange(property_change) => {
                                     match property_change {
-                                        peer::mpv::events::PropertyChange::Pause(is_paused) => {
+                                        peerwatch::mpv::events::PropertyChange::Pause(is_paused) => {
                                             if is_paused {
                                                 sender
                                                     .broadcast(
-                                                        postcard::to_allocvec(&peer::message::Message::new(peer::message::Payload::Pause))
+                                                        postcard::to_allocvec(&peerwatch::message::Message::new(peerwatch::message::Payload::Pause))
                                                             .unwrap()
                                                             .into(),
                                                     )
@@ -155,7 +155,7 @@ async fn main() {
                                             } else {
                                                 sender
                                                     .broadcast(
-                                                        postcard::to_allocvec(&peer::message::Message::new(peer::message::Payload::Play))
+                                                        postcard::to_allocvec(&peerwatch::message::Message::new(peerwatch::message::Payload::Play))
                                                             .unwrap()
                                                             .into(),
                                                     )
@@ -178,7 +178,7 @@ async fn main() {
             event = receiver.try_next() => {
                 match event {
                     Ok(Some(Event::Received(message))) => {
-                        let message: peer::message::Message =
+                        let message: peerwatch::message::Message =
                             postcard::from_bytes(&message.content).unwrap();
                         println!("got message: {message:?}");
                     }
@@ -198,7 +198,7 @@ async fn main() {
             _ = interval.tick() => {
                 sender
                     .broadcast(
-                        postcard::to_allocvec(&peer::message::Message::new(peer::message::Payload::Ping))
+                        postcard::to_allocvec(&peerwatch::message::Message::new(peerwatch::message::Payload::Ping))
                             .unwrap()
                             .into(),
                     )
