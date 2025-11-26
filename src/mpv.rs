@@ -1,48 +1,84 @@
 use interprocess::local_socket::tokio::{RecvHalf, SendHalf};
+use iroh::EndpointId;
 use iroh_gossip::api::GossipSender;
 use serde::{Deserialize, Serialize};
 use tokio::io::BufReader;
 
-use crate::{SKIP_NEXT_SEEK_EVENT, send_mpv_command};
+use crate::{
+    SKIP_NEXT_SEEK_EVENT,
+    message::{Message, Payload, UpdateTrigger},
+    send_mpv_command,
+};
 
 pub mod events;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Message {
+pub enum MpvMessage {
     Event(events::Event),
 }
 
+pub async fn get_playback_time(
+    mpv_writer: &mut SendHalf,
+    mpv_reader: &mut BufReader<RecvHalf>,
+) -> anyhow::Result<f64> {
+    let (_, property_reply) = send_mpv_command(
+        mpv_writer,
+        mpv_reader,
+        r#"{ "command": ["get_property", "playback-time"] }"#,
+    )
+    .await?;
+
+    let reply = serde_json::from_str::<serde_json::Value>(&property_reply)?;
+
+    let seek = reply["data"].as_f64().ok_or(anyhow::anyhow!("not f64"))?;
+
+    Ok(seek)
+}
+
+pub async fn get_paused(
+    mpv_writer: &mut SendHalf,
+    mpv_reader: &mut BufReader<RecvHalf>,
+) -> anyhow::Result<bool> {
+    let (_, property_reply) = send_mpv_command(
+        mpv_writer,
+        mpv_reader,
+        r#"{ "command": ["get_property", "pause"] }"#,
+    )
+    .await?;
+
+    let reply = serde_json::from_str::<serde_json::Value>(&property_reply)?;
+
+    let is_paused = reply["data"].as_bool().ok_or(anyhow::anyhow!("not bool"))?;
+
+    Ok(is_paused)
+}
+
 pub async fn handle_mpv_messages(
+    peer_id: EndpointId,
     sender: &GossipSender,
     read_buf: &str,
     mpv_writer: &mut SendHalf,
     mpv_reader: &mut BufReader<RecvHalf>,
 ) -> anyhow::Result<()> {
-    if let Ok(message) = serde_json::from_str::<Message>(read_buf) {
+    if let Ok(message) = serde_json::from_str::<MpvMessage>(read_buf) {
         match message {
-            Message::Event(event) => match event {
+            MpvMessage::Event(event) => match event {
                 events::Event::PropertyChange(property_change) => match property_change {
                     events::PropertyChange::Pause(is_paused) => {
-                        if is_paused {
-                            sender
-                                .broadcast(
-                                    postcard::to_allocvec(&crate::message::Message::new(
-                                        crate::message::Payload::Pause,
-                                    ))?
-                                    .into(),
-                                )
-                                .await?;
-                        } else {
-                            sender
-                                .broadcast(
-                                    postcard::to_allocvec(&crate::message::Message::new(
-                                        crate::message::Payload::Play,
-                                    ))?
-                                    .into(),
-                                )
-                                .await?;
-                        }
+                        sender
+                            .broadcast(
+                                postcard::to_allocvec(&Message::new(
+                                    peer_id,
+                                    Payload::StateUpdate {
+                                        position: get_playback_time(mpv_writer, mpv_reader).await?,
+                                        is_paused,
+                                        trigger: UpdateTrigger::UserAction,
+                                    },
+                                ))?
+                                .into(),
+                            )
+                            .await?;
                     }
                 },
                 events::Event::Seek => {
@@ -58,16 +94,21 @@ pub async fn handle_mpv_messages(
 
                     let reply = serde_json::from_str::<serde_json::Value>(&property_reply)?;
 
-                    let seek = reply["data"].as_f64().ok_or(anyhow::anyhow!("not f64"))?;
-
-                    sender
-                        .broadcast(
-                            postcard::to_allocvec(&crate::message::Message::new(
-                                crate::message::Payload::Seek(seek),
-                            ))?
-                            .into(),
-                        )
-                        .await?;
+                    if let Some(seek) = reply["data"].as_f64() {
+                        sender
+                            .broadcast(
+                                postcard::to_allocvec(&Message::new(
+                                    peer_id,
+                                    Payload::StateUpdate {
+                                        position: seek,
+                                        is_paused: get_paused(mpv_writer, mpv_reader).await?,
+                                        trigger: UpdateTrigger::UserAction,
+                                    },
+                                ))?
+                                .into(),
+                            )
+                            .await?;
+                    }
                 }
             },
         }

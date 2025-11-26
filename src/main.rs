@@ -1,23 +1,27 @@
-use iroh::SecretKey;
-use iroh_gossip::api::Event;
-use n0_future::StreamExt;
-use peerwatch::{
-    PeerPlayTicket, SKIP_NEXT_SEEK_EVENT, mpv::handle_mpv_messages, send_mpv_command,
-    wait_until_file_created,
-};
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
-use tokio::time::interval;
-
 use clap::{Parser, Subcommand};
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, NameType, ToFsName, ToNsName, traits::tokio::Stream as _,
 };
+use iroh::SecretKey;
 use iroh::protocol::Router;
 use iroh_gossip::Gossip;
+use iroh_gossip::api::Event;
+use n0_future::StreamExt;
+use peerwatch::message::Message;
+use peerwatch::mpv::get_paused;
+use peerwatch::mpv::get_playback_time;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::time::interval;
+
+use peerwatch::message::Payload;
+use peerwatch::{
+    PeerPlayTicket, SKIP_NEXT_SEEK_EVENT, mpv::handle_mpv_messages, send_mpv_command,
+    wait_until_file_created,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -139,40 +143,38 @@ async fn main() {
                     break;
                 }
 
-                handle_mpv_messages(&sender, &read_buf, &mut mpv_writer, &mut mpv_reader).await.unwrap();
+                handle_mpv_messages(router.endpoint().id(), &sender, &read_buf, &mut mpv_writer, &mut mpv_reader).await.unwrap();
 
                 read_buf.clear();
             }
             event = receiver.try_next() => {
                 match event {
                     Ok(Some(Event::Received(message))) => {
-                        let message: peerwatch::message::Message =
-                            postcard::from_bytes(&message.content).unwrap();
+                        let message: Message = postcard::from_bytes(&message.content).unwrap();
                         match message.payload {
-                            peerwatch::message::Payload::Play => {
+                            peerwatch::message::Payload::StateUpdate { position, is_paused, trigger: _ } => {
                                 send_mpv_command(
                                     &mut mpv_writer,
                                     &mut mpv_reader,
-                                    r#"{ "command": ["set_property", "pause", false] }"#,
+                                    &format!(r#"{{ "command": ["set_property", "pause", {is_paused}] }}"#),
                                 ).await.unwrap();
-                            },
-                            peerwatch::message::Payload::Pause => {
-                                send_mpv_command(
-                                    &mut mpv_writer,
-                                    &mut mpv_reader,
-                                    r#"{ "command": ["set_property", "pause", true] }"#,
-                                ).await.unwrap();
-                            },
-                            peerwatch::message::Payload::Seek(seek) => {
+
+                                let age_ms = message.age_ms();
+                                let their_current_position = if !is_paused {
+                                    position + (age_ms as f64 / 1000.0) // * playback_rate as f64
+                                } else {
+                                    position
+                                };
+
+                                // NOTE: could soft sync by adjusting speed instead of seeking
                                 let (_, _reply) = send_mpv_command(
                                     &mut mpv_writer,
                                     &mut mpv_reader,
-                                    &format!(r#"{{ "command": ["set_property", "playback-time", {seek}], "request_id": 100 }}"#),
+                                    &format!(r#"{{ "command": ["set_property", "playback-time", {their_current_position}] }}"#),
                                 ).await.unwrap();
 
                                 SKIP_NEXT_SEEK_EVENT.store(true, std::sync::atomic::Ordering::Release);
                             },
-                            peerwatch::message::Payload::Ping => {},
                         }
                     }
                     Ok(Some(msg)) => {
@@ -189,11 +191,27 @@ async fn main() {
                 }
             }
             _ = interval.tick() => {
+                let Ok(playback_time) =
+                    get_playback_time(&mut mpv_writer, &mut mpv_reader).await else {
+                    continue;
+                };
+
+                let Ok(is_paused) = get_paused(&mut mpv_writer, &mut mpv_reader).await else {
+                    continue;
+                };
+
                 sender
                     .broadcast(
-                        postcard::to_allocvec(&peerwatch::message::Message::new(peerwatch::message::Payload::Ping))
-                            .unwrap()
-                            .into(),
+                        postcard::to_allocvec(&Message::new(
+                            router.endpoint().id(),
+                            Payload::StateUpdate {
+                                position: playback_time,
+                                is_paused,
+                                trigger: peerwatch::message::UpdateTrigger::Periodic,
+                            },
+                        ))
+                        .unwrap()
+                        .into(),
                     )
                     .await
                     .unwrap();
