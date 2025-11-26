@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum Event {
     PropertyChange(PropertyChange),
+    Seek,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,7 +1,10 @@
 use iroh::SecretKey;
 use iroh_gossip::api::Event;
 use n0_future::StreamExt;
-use peerwatch::{PeerPlayTicket, send_mpv_command, wait_until_file_created};
+use peerwatch::{
+    PeerPlayTicket, SKIP_NEXT_SEEK_EVENT, mpv::handle_mpv_messages, send_mpv_command,
+    wait_until_file_created,
+};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -103,23 +106,23 @@ async fn main() {
     wait_until_file_created(name_str).unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let (read, mut write) = interprocess::local_socket::tokio::Stream::connect(name)
+    let (mpv_reader, mut mpv_writer) = interprocess::local_socket::tokio::Stream::connect(name)
         .await
         .unwrap()
         .split();
-    let mut read = BufReader::new(read);
+    let mut mpv_reader = BufReader::new(mpv_reader);
 
     send_mpv_command(
-        &mut write,
-        &mut read,
+        &mut mpv_writer,
+        &mut mpv_reader,
         r#"{ "command": ["observe_property", 0, "pause"] }"#,
     )
     .await
     .unwrap();
 
     send_mpv_command(
-        &mut write,
-        &mut read,
+        &mut mpv_writer,
+        &mut mpv_reader,
         r#"{ "command": ["get_property", "playback-time"] }"#,
     )
     .await
@@ -131,47 +134,12 @@ async fn main() {
 
     loop {
         tokio::select! {
-            Ok(bytes_read) = read.read_line(&mut read_buf) => {
+            Ok(bytes_read) = mpv_reader.read_line(&mut read_buf) => {
                 if bytes_read == 0 {
                     break;
                 }
 
-                if let Ok(message) = serde_json::from_str::<peerwatch::mpv::Message>(&read_buf) {
-                    match message {
-                        peerwatch::mpv::Message::Event(event) => {
-                            match event {
-                                peerwatch::mpv::events::Event::PropertyChange(property_change) => {
-                                    match property_change {
-                                        peerwatch::mpv::events::PropertyChange::Pause(is_paused) => {
-                                            if is_paused {
-                                                sender
-                                                    .broadcast(
-                                                        postcard::to_allocvec(&peerwatch::message::Message::new(peerwatch::message::Payload::Pause))
-                                                            .unwrap()
-                                                            .into(),
-                                                    )
-                                                    .await
-                                                    .unwrap();
-                                            } else {
-                                                sender
-                                                    .broadcast(
-                                                        postcard::to_allocvec(&peerwatch::message::Message::new(peerwatch::message::Payload::Play))
-                                                            .unwrap()
-                                                            .into(),
-                                                    )
-                                                    .await
-                                                    .unwrap();
-                                            }
-                                            println!("sent: {is_paused}");
-                                        },
-                                    }
-                                },
-                            }
-                        },
-                    }
-                } else {
-                    println!("read {bytes_read} bytes, message: {read_buf}");
-                }
+                handle_mpv_messages(&sender, &read_buf, &mut mpv_writer, &mut mpv_reader).await.unwrap();
 
                 read_buf.clear();
             }
@@ -180,7 +148,32 @@ async fn main() {
                     Ok(Some(Event::Received(message))) => {
                         let message: peerwatch::message::Message =
                             postcard::from_bytes(&message.content).unwrap();
-                        println!("got message: {message:?}");
+                        match message.payload {
+                            peerwatch::message::Payload::Play => {
+                                send_mpv_command(
+                                    &mut mpv_writer,
+                                    &mut mpv_reader,
+                                    r#"{ "command": ["set_property", "pause", false] }"#,
+                                ).await.unwrap();
+                            },
+                            peerwatch::message::Payload::Pause => {
+                                send_mpv_command(
+                                    &mut mpv_writer,
+                                    &mut mpv_reader,
+                                    r#"{ "command": ["set_property", "pause", true] }"#,
+                                ).await.unwrap();
+                            },
+                            peerwatch::message::Payload::Seek(seek) => {
+                                let (_, _reply) = send_mpv_command(
+                                    &mut mpv_writer,
+                                    &mut mpv_reader,
+                                    &format!(r#"{{ "command": ["set_property", "playback-time", {seek}], "request_id": 100 }}"#),
+                                ).await.unwrap();
+
+                                SKIP_NEXT_SEEK_EVENT.store(true, std::sync::atomic::Ordering::Release);
+                            },
+                            peerwatch::message::Payload::Ping => {},
+                        }
                     }
                     Ok(Some(msg)) => {
                         println!("got gossip message: {msg:?}");

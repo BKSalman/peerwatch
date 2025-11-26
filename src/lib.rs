@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::sync::atomic::AtomicBool;
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use interprocess::local_socket::tokio::{RecvHalf, SendHalf};
@@ -13,6 +14,8 @@ pub mod message;
 pub mod mpv;
 
 pub const ALPN: &[u8] = b"BKSalman/peerplay/0";
+
+pub static SKIP_NEXT_SEEK_EVENT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PeerPlayTicket {
