@@ -159,7 +159,11 @@ async fn main() {
                                     &format!(r#"{{ "command": ["set_property", "pause", {is_paused}] }}"#),
                                 ).await.unwrap();
 
+                                // TODO: should only sync with a specific node as a reference
+                                // to avoid latency conflicts.
+                                // this needs a leader election mechanism
                                 let age_ms = message.age_ms();
+                                println!("latency from peer {}: {age_ms}", message.peer_id);
                                 let their_current_position = if !is_paused {
                                     position + (age_ms as f64 / 1000.0) // * playback_rate as f64
                                 } else {
