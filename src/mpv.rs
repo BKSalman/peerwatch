@@ -55,63 +55,61 @@ pub async fn get_paused(
 }
 
 pub async fn handle_mpv_messages(
+    message: MpvMessage,
     peer_id: EndpointId,
     sender: &GossipSender,
-    read_buf: &str,
     mpv_writer: &mut SendHalf,
     mpv_reader: &mut BufReader<RecvHalf>,
 ) -> anyhow::Result<()> {
-    if let Ok(message) = serde_json::from_str::<MpvMessage>(read_buf) {
-        match message {
-            MpvMessage::Event(event) => match event {
-                events::Event::PropertyChange(property_change) => match property_change {
-                    events::PropertyChange::Pause(is_paused) => {
-                        sender
-                            .broadcast(
-                                postcard::to_allocvec(&Message::new(
-                                    peer_id,
-                                    Payload::StateUpdate {
-                                        position: get_playback_time(mpv_writer, mpv_reader).await?,
-                                        is_paused,
-                                        trigger: UpdateTrigger::UserAction,
-                                    },
-                                ))?
-                                .into(),
-                            )
-                            .await?;
-                    }
-                },
-                events::Event::Seek => {
-                    if SKIP_NEXT_SEEK_EVENT.swap(false, std::sync::atomic::Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    let (_, property_reply) = send_mpv_command(
-                        mpv_writer,
-                        mpv_reader,
-                        r#"{ "command": ["get_property", "playback-time"] }"#,
-                    )
-                    .await?;
-
-                    let reply = serde_json::from_str::<serde_json::Value>(&property_reply)?;
-
-                    if let Some(seek) = reply["data"].as_f64() {
-                        sender
-                            .broadcast(
-                                postcard::to_allocvec(&Message::new(
-                                    peer_id,
-                                    Payload::StateUpdate {
-                                        position: seek,
-                                        is_paused: get_paused(mpv_writer, mpv_reader).await?,
-                                        trigger: UpdateTrigger::UserAction,
-                                    },
-                                ))?
-                                .into(),
-                            )
-                            .await?;
-                    }
+    match message {
+        MpvMessage::Event(event) => match event {
+            events::Event::PropertyChange(property_change) => match property_change {
+                events::PropertyChange::Pause(is_paused) => {
+                    sender
+                        .broadcast(
+                            postcard::to_allocvec(&Message::new(
+                                peer_id,
+                                Payload::StateUpdate {
+                                    position: get_playback_time(mpv_writer, mpv_reader).await?,
+                                    is_paused,
+                                    trigger: UpdateTrigger::UserAction,
+                                },
+                            ))?
+                            .into(),
+                        )
+                        .await?;
                 }
             },
-        }
+            events::Event::Seek => {
+                if SKIP_NEXT_SEEK_EVENT.swap(false, std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
+                let (_, property_reply) = send_mpv_command(
+                    mpv_writer,
+                    mpv_reader,
+                    r#"{ "command": ["get_property", "playback-time"] }"#,
+                )
+                .await?;
+
+                let reply = serde_json::from_str::<serde_json::Value>(&property_reply)?;
+
+                if let Some(seek) = reply["data"].as_f64() {
+                    sender
+                        .broadcast(
+                            postcard::to_allocvec(&Message::new(
+                                peer_id,
+                                Payload::StateUpdate {
+                                    position: seek,
+                                    is_paused: get_paused(mpv_writer, mpv_reader).await?,
+                                    trigger: UpdateTrigger::UserAction,
+                                },
+                            ))?
+                            .into(),
+                        )
+                        .await?;
+                }
+            }
+        },
     }
 
     Ok(())

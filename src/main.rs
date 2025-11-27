@@ -8,6 +8,7 @@ use iroh_gossip::Gossip;
 use iroh_gossip::api::Event;
 use n0_future::StreamExt;
 use peerwatch::message::Message;
+use peerwatch::mpv::MpvMessage;
 use peerwatch::mpv::get_paused;
 use peerwatch::mpv::get_playback_time;
 use peerwatch::sha256_from_file;
@@ -155,7 +156,9 @@ async fn main() -> anyhow::Result<()> {
                     break Ok(());
                 }
 
-                handle_mpv_messages(router.endpoint().id(), &sender, &read_buf, &mut mpv_writer, &mut mpv_reader).await.unwrap();
+                if let Ok(message) = serde_json::from_str::<MpvMessage>(&read_buf) {
+                    let _ = handle_mpv_messages(message, router.endpoint().id(), &sender, &mut mpv_writer, &mut mpv_reader).await;
+                }
 
                 read_buf.clear();
             }

@@ -106,7 +106,7 @@ pub fn wait_until_file_created(file_path: impl AsRef<Path>) -> anyhow::Result<()
     Ok(())
 }
 
-pub struct PeerPlayNode {
+pub struct PeerWatchNode {
     gossip: Gossip,
 }
 
