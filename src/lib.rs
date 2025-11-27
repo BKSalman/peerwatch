@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
@@ -8,6 +8,7 @@ use iroh_gossip::{Gossip, TopicId};
 use iroh_tickets::Ticket;
 use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 pub mod message;
@@ -18,21 +19,43 @@ pub const ALPN: &[u8] = b"BKSalman/peerplay/0";
 pub static SKIP_NEXT_SEEK_EVENT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PeerPlayTicket {
+pub struct PeerWatchTicket {
     pub topic_id: TopicId,
     pub bootstrap: BTreeSet<EndpointId>,
+    pub video_sha256: Vec<u8>,
 }
 
-impl PeerPlayTicket {
-    pub fn new_random() -> Self {
-        let topic_id = TopicId::from_bytes(rand::random());
-        Self::new(topic_id)
+pub fn sha256_from_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+
+    let mut sha256 = Sha256::new();
+
+    let mut buf = [0u8; 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                sha256.update(&buf[..n]);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        buf.fill(0);
     }
 
-    pub fn new(topic_id: TopicId) -> Self {
+    Ok(sha256.finalize().to_vec())
+}
+
+impl PeerWatchTicket {
+    pub fn new_random(video: &Path) -> Self {
+        let topic_id = TopicId::from_bytes(rand::random());
+        Self::new(topic_id, video)
+    }
+
+    pub fn new(topic_id: TopicId, video: &Path) -> Self {
         Self {
             topic_id,
             bootstrap: Default::default(),
+            video_sha256: sha256_from_file(video).expect("failed to read video file"),
         }
     }
     pub fn deserialize(input: &str) -> anyhow::Result<Self> {
@@ -43,7 +66,7 @@ impl PeerPlayTicket {
     }
 }
 
-impl Ticket for PeerPlayTicket {
+impl Ticket for PeerWatchTicket {
     const KIND: &'static str = "peerplay";
 
     fn to_bytes(&self) -> Vec<u8> {

@@ -10,6 +10,7 @@ use n0_future::StreamExt;
 use peerwatch::message::Message;
 use peerwatch::mpv::get_paused;
 use peerwatch::mpv::get_playback_time;
+use peerwatch::sha256_from_file;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use tokio::time::interval;
 
 use peerwatch::message::Payload;
 use peerwatch::{
-    PeerPlayTicket, SKIP_NEXT_SEEK_EVENT, mpv::handle_mpv_messages, send_mpv_command,
+    PeerWatchTicket, SKIP_NEXT_SEEK_EVENT, mpv::handle_mpv_messages, send_mpv_command,
     wait_until_file_created,
 };
 
@@ -37,7 +38,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let secret_key = SecretKey::generate(&mut rand::rng());
@@ -56,8 +57,18 @@ async fn main() {
         .spawn();
 
     let (video, ticket) = match &cli.command {
-        Command::Create { video } => (video, PeerPlayTicket::new_random()),
-        Command::Join { video, ticket } => (video, PeerPlayTicket::deserialize(&ticket).unwrap()),
+        Command::Create { video } => (video, PeerWatchTicket::new_random(&video)),
+        Command::Join { video, ticket } => {
+            let peerwatch_ticket = PeerWatchTicket::deserialize(&ticket).unwrap();
+            let video_sha256 = sha256_from_file(&video).expect("Failed to read video file");
+            if peerwatch_ticket.video_sha256 != video_sha256 {
+                return Err(anyhow::anyhow!(
+                    "ERROR: Provided video doesn't match host provided video"
+                ));
+            }
+
+            (video, peerwatch_ticket)
+        }
     };
 
     let mut our_ticket = ticket.clone();
@@ -140,7 +151,8 @@ async fn main() {
         tokio::select! {
             Ok(bytes_read) = mpv_reader.read_line(&mut read_buf) => {
                 if bytes_read == 0 {
-                    break;
+                    println!("mpv disconnected");
+                    break Ok(());
                 }
 
                 handle_mpv_messages(router.endpoint().id(), &sender, &read_buf, &mut mpv_writer, &mut mpv_reader).await.unwrap();
@@ -186,11 +198,11 @@ async fn main() {
                     }
                     Ok(None) => {
                         println!("gossip stream ended");
-                        break;
+                        break Ok(());
                     }
                     Err(e) => {
                         println!("gossip error: {e:?}");
-                        break;
+                        break Err(e.into());
                     }
                 }
             }
