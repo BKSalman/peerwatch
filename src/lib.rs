@@ -1,11 +1,16 @@
 use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use interprocess::local_socket::tokio::{RecvHalf, SendHalf};
-use iroh::EndpointId;
+use iroh::protocol::Router;
+use iroh::{EndpointId, SecretKey};
+use iroh_gossip::api::Event;
 use iroh_gossip::{Gossip, TopicId};
 use iroh_tickets::Ticket;
+use n0_future::StreamExt;
+use n0_future::boxed::BoxStream;
 use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -107,7 +112,160 @@ pub fn wait_until_file_created(file_path: impl AsRef<Path>) -> anyhow::Result<()
 }
 
 pub struct PeerWatchNode {
-    gossip: Gossip,
+    pub gossip: Gossip,
+    router: Router,
+    peers: BTreeSet<EndpointId>,
+    pub leader: Option<EndpointId>,
+}
+
+impl PeerWatchNode {
+    pub async fn spawn() -> anyhow::Result<Self> {
+        let secret_key = SecretKey::generate(&mut rand::rng());
+
+        let endpoint = iroh::Endpoint::builder()
+            .secret_key(secret_key.clone())
+            .alpns(vec![iroh_gossip::ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+
+        let router = Router::builder(endpoint)
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .spawn();
+
+        let mut peers = BTreeSet::new();
+
+        peers.insert(router.endpoint().id());
+
+        Ok(Self {
+            gossip,
+            router,
+            peers,
+            leader: None,
+        })
+    }
+
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.router.endpoint().id()
+    }
+
+    pub async fn join(
+        &mut self,
+        ticket: &PeerWatchTicket,
+    ) -> anyhow::Result<(
+        iroh_gossip::api::GossipSender,
+        BoxStream<anyhow::Result<message::Event>>,
+    )> {
+        self.peers.extend(ticket.bootstrap.clone());
+
+        if self.peers.len() == 1 {
+            println!("I'm the leader");
+            self.leader = Some(self.endpoint_id());
+        }
+
+        let bootstrap: Vec<_> = ticket.bootstrap.iter().cloned().collect();
+
+        let (sender, receiver) = if bootstrap.is_empty() {
+            self.gossip
+                .subscribe(ticket.topic_id, bootstrap)
+                .await?
+                .split()
+        } else {
+            self.gossip
+                .subscribe_and_join(ticket.topic_id, bootstrap)
+                .await?
+                .split()
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        sender
+            .broadcast(
+                postcard::to_allocvec(&crate::message::Event::Presence {
+                    timestamp_ms: now,
+                    endpoint_id: self.endpoint_id(),
+                })
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let receiver = n0_future::stream::try_unfold(receiver, move |mut r| async move {
+            loop {
+                let Some(msg) = r.try_next().await? else {
+                    return Ok(None);
+                };
+
+                let event = match msg {
+                    Event::Received(message) => {
+                        let Ok(event) =
+                            postcard::from_bytes::<crate::message::Event>(&message.content)
+                        else {
+                            continue;
+                        };
+
+                        event
+                    }
+                    Event::NeighborUp(id) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        crate::message::Event::PeerJoined {
+                            timestamp_ms: now,
+                            endpoint_id: id,
+                        }
+                    }
+                    Event::NeighborDown(id) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        crate::message::Event::PeerLeft {
+                            timestamp_ms: now,
+                            endpoint_id: id,
+                        }
+                    }
+                    msg => {
+                        println!("got gossip message: {msg:?}");
+                        return Ok(None);
+                    }
+                };
+
+                break Ok(Some((event, r)));
+            }
+        });
+
+        Ok((sender, Box::pin(receiver)))
+    }
+
+    /// Returns true if it's a new peer
+    pub fn peer_joined(&mut self, endpoint_id: EndpointId) -> bool {
+        self.peers.insert(endpoint_id)
+    }
+
+    pub fn peer_left(&mut self, endpoint_id: &EndpointId) {
+        self.peers.remove(endpoint_id);
+        println!("current leader: {:?}", self.leader);
+        if Some(endpoint_id) == self.leader.as_ref() {
+            self.elect_leader();
+        }
+    }
+
+    pub fn elect_leader(&mut self) {
+        self.leader = self.peers.iter().next_back().cloned();
+        println!("new leader: {:?}", self.leader);
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.leader == Some(self.endpoint_id())
+    }
 }
 
 pub async fn send_mpv_command(

@@ -2,27 +2,21 @@ use clap::{Parser, Subcommand};
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, NameType, ToFsName, ToNsName, traits::tokio::Stream as _,
 };
-use iroh::SecretKey;
-use iroh::protocol::Router;
-use iroh_gossip::Gossip;
-use iroh_gossip::api::Event;
 use n0_future::StreamExt;
-use peerwatch::message::Message;
-use peerwatch::mpv::MpvMessage;
-use peerwatch::mpv::get_paused;
-use peerwatch::mpv::get_playback_time;
-use peerwatch::sha256_from_file;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::time::interval;
+use tokio::time::Instant;
 
-use peerwatch::message::Payload;
 use peerwatch::{
-    PeerWatchTicket, SKIP_NEXT_SEEK_EVENT, mpv::handle_mpv_messages, send_mpv_command,
-    wait_until_file_created,
+    PeerWatchNode, PeerWatchTicket, SKIP_NEXT_SEEK_EVENT,
+    message::StateUpdate,
+    mpv::{MpvMessage, get_paused, get_playback_time, handle_mpv_messages},
+    send_mpv_command, sha256_from_file, wait_until_file_created,
 };
 
 #[derive(Parser)]
@@ -42,20 +36,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let secret_key = SecretKey::generate(&mut rand::rng());
-
-    let endpoint = iroh::Endpoint::builder()
-        .secret_key(secret_key.clone())
-        .alpns(vec![iroh_gossip::ALPN.to_vec()])
-        .bind()
-        .await
-        .unwrap();
-
-    let gossip = Gossip::builder().spawn(endpoint.clone());
-
-    let router = Router::builder(endpoint)
-        .accept(iroh_gossip::ALPN, gossip.clone())
-        .spawn();
+    let mut node = PeerWatchNode::spawn().await?;
 
     let (video, ticket) = match &cli.command {
         Command::Create { video } => (video, PeerWatchTicket::new_random(&video)),
@@ -73,25 +54,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut our_ticket = ticket.clone();
-    our_ticket.bootstrap = [router.endpoint().id()].into_iter().collect();
+    our_ticket.bootstrap = [node.endpoint_id()].into_iter().collect();
     println!("* ticket to join this chat:");
     println!("{}", our_ticket.serialize());
 
-    let bootstrap = ticket.bootstrap.iter().cloned().collect();
-
     println!("* waiting for peers ...");
-    let (sender, mut receiver) = match cli.command {
-        Command::Create { .. } => gossip
-            .subscribe(ticket.topic_id, bootstrap)
-            .await
-            .unwrap()
-            .split(),
-        Command::Join { .. } => gossip
-            .subscribe_and_join(ticket.topic_id, bootstrap)
-            .await
-            .unwrap()
-            .split(),
-    };
+    let (sender, mut receiver) = node.join(&ticket).await?;
 
     let (name_str, name) = if GenericFilePath::is_supported() {
         let id: u16 = rand::random();
@@ -136,17 +104,14 @@ async fn main() -> anyhow::Result<()> {
     .await
     .unwrap();
 
-    send_mpv_command(
-        &mut mpv_writer,
-        &mut mpv_reader,
-        r#"{ "command": ["get_property", "playback-time"] }"#,
-    )
-    .await
-    .unwrap();
-
-    let mut interval = interval(Duration::from_secs(5));
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
 
     let mut read_buf = String::with_capacity(128);
+
+    let mut leader_interval = tokio::time::interval_at(
+        Instant::now().checked_add(Duration::from_secs(10)).unwrap(),
+        Duration::from_secs(10),
+    );
 
     loop {
         tokio::select! {
@@ -157,83 +122,148 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 if let Ok(message) = serde_json::from_str::<MpvMessage>(&read_buf) {
-                    let _ = handle_mpv_messages(message, router.endpoint().id(), &sender, &mut mpv_writer, &mut mpv_reader).await;
+                    let _ = handle_mpv_messages(message, node.endpoint_id(), &sender, &mut mpv_writer, &mut mpv_reader).await;
                 }
 
                 read_buf.clear();
             }
             event = receiver.try_next() => {
                 match event {
-                    Ok(Some(Event::Received(message))) => {
-                        let message: Message = postcard::from_bytes(&message.content).unwrap();
-                        match message.payload {
-                            peerwatch::message::Payload::StateUpdate { position, is_paused, trigger: _ } => {
-                                send_mpv_command(
-                                    &mut mpv_writer,
-                                    &mut mpv_reader,
-                                    &format!(r#"{{ "command": ["set_property", "pause", {is_paused}] }}"#),
-                                ).await.unwrap();
+                    Ok(Some(peerwatch::message::Event::StateUpdate(state_update))) => {
+                        send_mpv_command(
+                            &mut mpv_writer,
+                            &mut mpv_reader,
+                            &format!(r#"{{ "command": ["set_property", "pause", {}] }}"#, state_update.is_paused),
+                        )
+                        .await
+                        .unwrap();
 
-                                // TODO: should only sync with a specific node as a reference
-                                // to avoid latency conflicts.
-                                // this needs a leader election mechanism
-                                let age_ms = message.age_ms();
-                                println!("latency from peer {}: {age_ms}", message.peer_id);
-                                let their_current_position = if !is_paused {
-                                    position + (age_ms as f64 / 1000.0) // * playback_rate as f64
-                                } else {
-                                    position
-                                };
+                        let age_ms = state_update.age_ms();
+                        println!("latency from peer {}: {age_ms}", state_update.peer_id);
+                        let their_current_position = if !state_update.is_paused {
+                            state_update.position + (age_ms as f64 / 1000.0)
+                        } else {
+                            state_update.position
+                        };
+                        let (_,_reply) = send_mpv_command(
+                            &mut mpv_writer,
+                            &mut mpv_reader,
+                            &format!(r#"{{ "command": ["set_property", "playback-time", {their_current_position}] }}"#)
+                        ) .await.unwrap();
 
-                                // NOTE: could soft sync by adjusting speed instead of seeking
-                                let (_, _reply) = send_mpv_command(
-                                    &mut mpv_writer,
-                                    &mut mpv_reader,
-                                    &format!(r#"{{ "command": ["set_property", "playback-time", {their_current_position}] }}"#),
-                                ).await.unwrap();
+                        SKIP_NEXT_SEEK_EVENT.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Ok(Some(peerwatch::message::Event::Presence { timestamp_ms: _, endpoint_id })) => {
+                        println!("{endpoint_id}: presence");
 
-                                SKIP_NEXT_SEEK_EVENT.store(true, std::sync::atomic::Ordering::Release);
-                            },
+                        if node.leader == Some(endpoint_id) {
+                            leader_interval.reset();
                         }
-                    }
-                    Ok(Some(msg)) => {
-                        println!("got gossip message: {msg:?}");
-                    }
-                    Ok(None) => {
-                        println!("gossip stream ended");
-                        break Ok(());
-                    }
-                    Err(e) => {
-                        println!("gossip error: {e:?}");
-                        break Err(e.into());
-                    }
+
+                        if node.peer_joined(endpoint_id) && node.is_leader() {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+
+                            sender
+                                .broadcast(
+                                    postcard::to_allocvec(&peerwatch::message::Event::AnnounceLeader {
+                                        timestamp_ms: now,
+                                        endpoint_id: node.endpoint_id()
+                                    })
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    },
+                    Ok(Some(peerwatch::message::Event::PeerJoined { timestamp_ms: _, endpoint_id })) => {
+                        println!("{endpoint_id}: joined");
+
+                        if node.peer_joined(endpoint_id) && node.is_leader() {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            sender
+                                .broadcast(
+                                    postcard::to_allocvec(&peerwatch::message::Event::AnnounceLeader {
+                                        timestamp_ms: now, endpoint_id: node.endpoint_id()
+                                    })
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    },
+                    Ok(Some(peerwatch::message::Event::PeerLeft { timestamp_ms: _, endpoint_id })) => {
+                        println!("{endpoint_id}: left");
+                        node.peer_left(&endpoint_id)
+                    },
+                    Ok(Some(peerwatch::message::Event::AnnounceLeader { timestamp_ms: _, endpoint_id })) => {
+                        println!("{endpoint_id}: announcing leadership");
+                        // TODO: add some challenge mechanism
+                        // instead of just accepting the announced leader
+                        node.leader = Some(endpoint_id);
+                    },
+                    _ => {}
                 }
             }
             _ = interval.tick() => {
-                let Ok(playback_time) =
-                    get_playback_time(&mut mpv_writer, &mut mpv_reader).await else {
-                    continue;
-                };
+                if node.is_leader() {
+                    let Ok(playback_time) =
+                        get_playback_time(&mut mpv_writer, &mut mpv_reader).await else {
+                        continue;
+                    };
 
-                let Ok(is_paused) = get_paused(&mut mpv_writer, &mut mpv_reader).await else {
-                    continue;
-                };
+                    let Ok(is_paused) = get_paused(&mut mpv_writer, &mut mpv_reader).await else {
+                        continue;
+                    };
+
+                    sender
+                        .broadcast(
+                            postcard::to_allocvec(&peerwatch::message::Event::StateUpdate(StateUpdate::new(
+                                node.endpoint_id(),
+                                    playback_time,
+                                    is_paused,
+                                    peerwatch::message::UpdateTrigger::Periodic,
+                            )))
+                            .unwrap()
+                            .into(),
+                        )
+                        .await
+                        .unwrap();
+                }
+
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
 
                 sender
                     .broadcast(
-                        postcard::to_allocvec(&Message::new(
-                            router.endpoint().id(),
-                            Payload::StateUpdate {
-                                position: playback_time,
-                                is_paused,
-                                trigger: peerwatch::message::UpdateTrigger::Periodic,
-                            },
-                        ))
+                        postcard::to_allocvec(&peerwatch::message::Event::Presence {
+                            timestamp_ms: now,
+                            endpoint_id: node.endpoint_id(),
+                        })
                         .unwrap()
                         .into(),
                     )
                     .await
                     .unwrap();
+            }
+            _ = leader_interval.tick() => {
+                println!("alo");
+                if !node.is_leader() {
+                    if let Some(leader) = node.leader.clone() {
+                        node.peer_left(&leader);
+                    } else {
+                        node.elect_leader();
+                    }
+                }
             }
         }
     }

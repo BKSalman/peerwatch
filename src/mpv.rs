@@ -6,7 +6,7 @@ use tokio::io::BufReader;
 
 use crate::{
     SKIP_NEXT_SEEK_EVENT,
-    message::{Message, Payload, UpdateTrigger},
+    message::{StateUpdate, UpdateTrigger},
     send_mpv_command,
 };
 
@@ -67,13 +67,13 @@ pub async fn handle_mpv_messages(
                 events::PropertyChange::Pause(is_paused) => {
                     sender
                         .broadcast(
-                            postcard::to_allocvec(&Message::new(
-                                peer_id,
-                                Payload::StateUpdate {
-                                    position: get_playback_time(mpv_writer, mpv_reader).await?,
+                            postcard::to_allocvec(&crate::message::Event::StateUpdate(
+                                StateUpdate::new(
+                                    peer_id,
+                                    get_playback_time(mpv_writer, mpv_reader).await?,
                                     is_paused,
-                                    trigger: UpdateTrigger::UserAction,
-                                },
+                                    UpdateTrigger::UserAction,
+                                ),
                             ))?
                             .into(),
                         )
@@ -96,13 +96,13 @@ pub async fn handle_mpv_messages(
                 if let Some(seek) = reply["data"].as_f64() {
                     sender
                         .broadcast(
-                            postcard::to_allocvec(&Message::new(
-                                peer_id,
-                                Payload::StateUpdate {
-                                    position: seek,
-                                    is_paused: get_paused(mpv_writer, mpv_reader).await?,
-                                    trigger: UpdateTrigger::UserAction,
-                                },
+                            postcard::to_allocvec(&crate::message::Event::StateUpdate(
+                                StateUpdate::new(
+                                    peer_id,
+                                    seek,
+                                    get_paused(mpv_writer, mpv_reader).await?,
+                                    UpdateTrigger::UserAction,
+                                ),
                             ))?
                             .into(),
                         )
