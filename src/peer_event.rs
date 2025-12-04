@@ -4,7 +4,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum Event {
+pub enum PeerEvent {
     StateUpdate(StateUpdate),
     PeerJoined {
         timestamp_ms: u64,

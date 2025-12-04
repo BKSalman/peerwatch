@@ -6,7 +6,6 @@ use std::{collections::BTreeSet, path::Path, time::Duration};
 use interprocess::local_socket::tokio::{RecvHalf, SendHalf};
 use iroh::protocol::Router;
 use iroh::{EndpointId, SecretKey};
-use iroh_gossip::api::Event;
 use iroh_gossip::{Gossip, TopicId};
 use iroh_tickets::Ticket;
 use n0_future::StreamExt;
@@ -16,12 +15,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-pub mod message;
+pub mod app;
 pub mod mpv;
+pub mod peer_event;
 
 pub const ALPN: &[u8] = b"BKSalman/peerplay/0";
 
 pub static SKIP_NEXT_SEEK_EVENT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+pub enum Event {
+    MpvEvent(mpv::events::Event),
+    PeerEvent(peer_event::PeerEvent),
+    RedrawRequested,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PeerWatchTicket {
@@ -156,7 +163,7 @@ impl PeerWatchNode {
         ticket: &PeerWatchTicket,
     ) -> anyhow::Result<(
         iroh_gossip::api::GossipSender,
-        BoxStream<anyhow::Result<message::Event>>,
+        BoxStream<anyhow::Result<peer_event::PeerEvent>>,
     )> {
         self.peers.extend(ticket.bootstrap.clone());
 
@@ -186,7 +193,7 @@ impl PeerWatchNode {
 
         sender
             .broadcast(
-                postcard::to_allocvec(&crate::message::Event::Presence {
+                postcard::to_allocvec(&crate::peer_event::PeerEvent::Presence {
                     timestamp_ms: now,
                     endpoint_id: self.endpoint_id(),
                 })
@@ -203,31 +210,31 @@ impl PeerWatchNode {
                 };
 
                 let event = match msg {
-                    Event::Received(message) => {
+                    iroh_gossip::api::Event::Received(message) => {
                         let Ok(event) =
-                            postcard::from_bytes::<crate::message::Event>(&message.content)
+                            postcard::from_bytes::<crate::peer_event::PeerEvent>(&message.content)
                         else {
                             continue;
                         };
 
                         event
                     }
-                    Event::NeighborUp(id) => {
+                    iroh_gossip::api::Event::NeighborUp(id) => {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64;
-                        crate::message::Event::PeerJoined {
+                        crate::peer_event::PeerEvent::PeerJoined {
                             timestamp_ms: now,
                             endpoint_id: id,
                         }
                     }
-                    Event::NeighborDown(id) => {
+                    iroh_gossip::api::Event::NeighborDown(id) => {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64;
-                        crate::message::Event::PeerLeft {
+                        crate::peer_event::PeerEvent::PeerLeft {
                             timestamp_ms: now,
                             endpoint_id: id,
                         }

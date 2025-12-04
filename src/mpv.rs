@@ -6,7 +6,7 @@ use tokio::io::BufReader;
 
 use crate::{
     SKIP_NEXT_SEEK_EVENT,
-    message::{StateUpdate, UpdateTrigger},
+    peer_event::{StateUpdate, UpdateTrigger},
     send_mpv_command,
 };
 
@@ -67,7 +67,7 @@ pub async fn handle_mpv_messages(
                 events::PropertyChange::Pause(is_paused) => {
                     sender
                         .broadcast(
-                            postcard::to_allocvec(&crate::message::Event::StateUpdate(
+                            postcard::to_allocvec(&crate::peer_event::PeerEvent::StateUpdate(
                                 StateUpdate::new(
                                     peer_id,
                                     get_playback_time(mpv_writer, mpv_reader).await?,
@@ -96,7 +96,7 @@ pub async fn handle_mpv_messages(
                 if let Some(seek) = reply["data"].as_f64() {
                     sender
                         .broadcast(
-                            postcard::to_allocvec(&crate::message::Event::StateUpdate(
+                            postcard::to_allocvec(&crate::peer_event::PeerEvent::StateUpdate(
                                 StateUpdate::new(
                                     peer_id,
                                     seek,
