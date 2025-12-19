@@ -3,19 +3,28 @@ name = "peerwatch"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+
 [dependencies]
 anyhow = "1.0.100"
+bao-tree = "0.16.0"
+bytemuck = { version = "1.24.0", features = ["derive"] }
 clap = { version = "4.5.53", features = ["derive"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+egui-wgpu = "0.33.3"
+egui_glow = { version = "0.33.2", features = ["winit"] }
 eros = "0.5.0"
+ffmpeg-next = "8.0.0"
 glow = "0.16.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
 indexmap = "2.12.1"
 interprocess = { version = "2.2.3", features = ["tokio"] }
 iroh = "0.95.1"
+iroh-blobs = "0.97.0"
 iroh-gossip = "0.95.0"
 iroh-tickets = "0.2.0"
-libmpv2 = { git = "https://github.com/BKSalman/libmpv2-rs", rev = "3846aa6" }
 n0-future = "0.3.1"
 notify = "8.2.0"
 postcard = "1.1.3"
@@ -24,5 +33,21 @@ raw-window-handle = "0.6.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 sha2 = "0.10.9"
+smallvec = "1.15.1"
 tokio = { version = "1.48.0", features = ["full"] }
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+wgpu = "27.0.1"
 winit = "0.30.12"
+
+[dependencies.eframe]
+version = "0.33.3"
+default-features = false
+features = [
+  "accesskit",
+  "default_fonts",
+  "wayland",
+  "web_screen_reader",
+  "x11",
+  "wgpu"
+]

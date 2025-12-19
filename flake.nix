@@ -12,14 +12,15 @@
         pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
       in
     with pkgs; {
-      devShells.${system}.default = mkShell rec {
+      devShells.${system}.default = mkShell.override { stdenv = pkgs.clangStdenv; } rec {
 
           packages = [
             (rust-bin.stable.latest.default.override {
               extensions = [ "rust-src" "rust-analyzer" ];
             })
+            cargo-flamegraph
+            samply
             lldb
-            mpv
           ];
           
           nativeBuildInputs = with pkgs; [
@@ -29,6 +30,7 @@
           ];
           
           buildInputs = with pkgs; [
+            ffmpeg
             fontconfig
             freetype
 
@@ -48,6 +50,7 @@
           ];
 
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath buildInputs}:${addDriverRunpath.driverLink}/lib";
+          LIBCLANG_PATH = with pkgs; "${llvmPackages.libclang.lib}/lib";
         };
 
       formatter.x86_64-linux = legacyPackages.${system}.nixpkgs-fmt;
