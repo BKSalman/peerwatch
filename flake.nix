@@ -30,6 +30,7 @@
           ];
           
           buildInputs = with pkgs; [
+            alsa-lib
             ffmpeg
             fontconfig
             freetype
