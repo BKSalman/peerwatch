@@ -426,6 +426,7 @@ pub fn spawn_decoder(
         let mut frame = FfmpegFrame::empty();
 
         let ticker = crossbeam::channel::tick(Duration::from_micros(100));
+        let mut scaler = None;
 
         loop {
             crossbeam::select! {
@@ -448,15 +449,23 @@ pub fn spawn_decoder(
                                 while decoder.receive_frame(&mut frame).is_ok() {
                                     let frame = {
                                         let mut rgb_frame = FfmpegFrame::empty();
-                                        let mut scaler = Context::get(
-                                            frame.format(),
-                                            frame.width(),
-                                            frame.height(),
-                                            ffmpeg::format::Pixel::RGBA,
-                                            frame.width(),
-                                            frame.height(),
-                                            Flags::BILINEAR,
-                                        )?;
+                                        let scaler = if let Some(scaler) = &mut scaler {
+                                            scaler
+                                        } else {
+                                            let new_scaler = Context::get(
+                                                frame.format(),
+                                                frame.width(),
+                                                frame.height(),
+                                                ffmpeg::format::Pixel::RGBA,
+                                                frame.width(),
+                                                frame.height(),
+                                                Flags::BILINEAR,
+                                            )?;
+                                            scaler = Some(new_scaler);
+
+                                            scaler.as_mut().unwrap()
+                                        };
+
                                         scaler.run(&frame, &mut rgb_frame)?;
                                         rgb_frame
                                     };
