@@ -5,15 +5,16 @@ use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
+use anyhow::Context as _;
 use bao_tree::ChunkNum;
 use clap::{Parser, Subcommand};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::StreamConfig;
 use eframe::egui;
 use ffmpeg::{
     frame::Video as FfmpegVideoFrame,
     software::scaling::{Context, Flags},
 };
-use ffmpeg_next as ffmpeg;
+use ffmpeg_next::{self as ffmpeg, Rational};
 use iroh::protocol::Router;
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::BlobsProtocol;
@@ -24,8 +25,10 @@ use iroh_gossip::{Gossip, TopicId};
 use iroh_tickets::Ticket;
 use n0_future::StreamExt;
 use n0_future::boxed::BoxStream;
-use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer as _, Producer, Split as _};
+use ringbuf::SharedRb;
+use ringbuf::storage::Heap;
+use ringbuf::traits::Producer;
+use ringbuf::wrap::caching::Caching;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -63,6 +66,10 @@ pub enum Event {
     VideoFrame(VideoFrame),
 }
 
+pub enum FfmpegFrame {
+    Video(Arc<FfmpegVideoFrame>),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PeerWatchTicket {
     pub topic_id: TopicId,
@@ -91,12 +98,12 @@ pub fn sha256_from_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 impl PeerWatchTicket {
-    pub fn new_random(video: &Path, blob_ticket: BlobTicket) -> Self {
+    pub fn new_random(blob_ticket: BlobTicket) -> Self {
         let topic_id = TopicId::from_bytes(rand::random());
-        Self::new(topic_id, video, blob_ticket)
+        Self::new(topic_id, blob_ticket)
     }
 
-    pub fn new(topic_id: TopicId, video: &Path, blob_ticket: BlobTicket) -> Self {
+    pub fn new(topic_id: TopicId, blob_ticket: BlobTicket) -> Self {
         Self {
             topic_id,
             bootstrap: Default::default(),
@@ -161,7 +168,7 @@ impl PeerWatchNode {
         peers.insert(router.endpoint().id());
         let blob_ticket = BlobTicket::new(router.endpoint().addr(), tag.hash, tag.format);
 
-        let ticket = PeerWatchTicket::new_random(&video, blob_ticket);
+        let ticket = PeerWatchTicket::new_random(blob_ticket);
 
         Ok(Self {
             gossip,
@@ -285,7 +292,7 @@ impl PeerWatchNode {
                         }
                     }
                     msg => {
-                        println!("got gossip message: {msg:?}");
+                        tracing::debug!("got gossip message: {msg:?}");
                         return Ok(None);
                     }
                 };
@@ -330,14 +337,14 @@ impl PeerWatchNode {
     }
 }
 
-const LATENCY: f32 = 150.0;
-
 pub fn spawn_decoder(
     path: impl AsRef<Path>,
-    frame_tx: std::sync::mpsc::Sender<(i64, Arc<FfmpegVideoFrame>)>,
+    frame_tx: crossbeam::channel::Sender<(i64, FfmpegFrame)>,
     seek_rx: crossbeam::channel::Receiver<i64>,
+    audio_config: StreamConfig,
+    mut audio_producer: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
     ctx: egui::Context,
-) -> anyhow::Result<(u32, u32)> {
+) -> anyhow::Result<(Rational, u32, u32)> {
     let path = path.as_ref().to_path_buf();
     let mut ictx = ffmpeg::format::input(&path).unwrap();
     let video_stream = ictx
@@ -346,76 +353,33 @@ pub fn spawn_decoder(
         .ok_or(anyhow::anyhow!("No video stream"))?;
     let video_stream_index = video_stream.index();
 
-    let audio_stream_info = ictx
-        .streams()
-        .best(ffmpeg::media::Type::Audio)
-        .map(|stream| (stream.index(), stream.parameters()));
+    let audio_stream = ictx.streams().best(ffmpeg::media::Type::Audio);
 
     let context_decoder =
         ffmpeg::codec::context::Context::from_parameters(video_stream.parameters()).unwrap();
-    let video_decoder = context_decoder.decoder().video().unwrap();
-    let ret = (video_decoder.width(), video_decoder.height());
+    let mut video_decoder = context_decoder.decoder().video().unwrap();
+    video_decoder.set_time_base(video_stream.time_base());
+    let ret = (
+        video_stream.time_base(),
+        video_decoder.width(),
+        video_decoder.height(),
+    );
 
-    if let Some((audio_stream_index, audio_params)) = audio_stream_info {
-        let (audio_packet_tx, audio_packet_rx) = crossbeam::channel::unbounded::<ffmpeg::Packet>();
+    if let Some(audio_stream) = audio_stream {
+        let audio_stream_index = audio_stream.index();
+        let audio_params = audio_stream.parameters();
+        let (audio_packet_tx, audio_packet_rx) = crossbeam::channel::bounded::<ffmpeg::Packet>(128);
         let (video_packet_tx, video_packet_rx) = crossbeam::channel::unbounded::<ffmpeg::Packet>();
         let seek_rx_audio = seek_rx.clone();
         let seek_rx_video = seek_rx.clone();
+        let frame_tx_video = frame_tx.clone();
+        let audio_time_base = audio_stream.time_base();
 
         std::thread::spawn(move || {
-            let host = cpal::default_host();
-            let device = host
-                .default_output_device()
-                .expect("no output device available");
-            let mut supported_configs_range = device
-                .supported_output_configs()
-                .expect("error while querying configs");
-            let supported_config = supported_configs_range
-                .next()
-                .expect("no supported config?!")
-                .with_sample_rate(48000);
-            let config: cpal::StreamConfig = supported_config.into();
-
-            let latency_frames = (LATENCY / 1_000.0) * config.sample_rate as f32;
-            let latency_samples = latency_frames as usize * config.channels as usize;
-
-            let context = ffmpeg::codec::context::Context::from_parameters(audio_params).unwrap();
-            let mut audio_decoder = AudioDecoder::new(&config, context);
-
-            let ring = HeapRb::<f32>::new(latency_samples * 2);
-            let (mut producer, mut consumer) = ring.split();
-
-            // Pre-fill with silence
-            for _ in 0..latency_samples {
-                producer.try_push(0.0).unwrap();
-            }
-
-            let volume =
-                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(f32::to_bits(0.005)));
-            let volume_clone = volume.clone();
-
-            let stream = device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        let volume_gain =
-                            f32::from_bits(volume_clone.load(std::sync::atomic::Ordering::Relaxed));
-
-                        for sample in data.iter_mut() {
-                            *sample = match consumer.try_pop() {
-                                Some(s) => s * volume_gain,
-                                None => 0.0,
-                            };
-                        }
-                    },
-                    move |err| {
-                        tracing::error!("{err}");
-                    },
-                    None,
-                )
-                .unwrap();
-
-            stream.play().unwrap();
+            let mut context =
+                ffmpeg::codec::context::Context::from_parameters(audio_params).unwrap();
+            context.set_time_base(audio_time_base);
+            let mut audio_decoder = AudioDecoder::new(&audio_config, context);
 
             loop {
                 crossbeam::select! {
@@ -433,11 +397,15 @@ pub fn spawn_decoder(
                                 }
 
                                 loop {
-                                    match audio_decoder.pop_samples() {
-                                        Ok(Some(samples)) => {
+                                    match audio_decoder.pop_frame() {
+                                        Ok(Some((frame, _pts))) => {
+                                            let expected_bytes =
+                                                frame.samples() * frame.channels() as usize * core::mem::size_of::<f32>();
+                                            let samples = bytemuck::cast_slice(&frame.data(0)[..expected_bytes]);
                                             for sample in samples {
-                                                while producer.try_push(*sample).is_err() {
+                                                while audio_producer.try_push(*sample).is_err() {
                                                     std::thread::sleep(std::time::Duration::from_micros(100));
+                                                    // tracing::debug!("can't push audio");
                                                 }
                                             }
                                         }
@@ -449,118 +417,36 @@ pub fn spawn_decoder(
                                     }
                                 }
                             },
-                            Err(_) => return,
-                        }
-                    }
-                }
-            }
-        });
-
-        std::thread::spawn(move || -> anyhow::Result<()> {
-            let mut video_decoder = video_decoder;
-            let mut video_frame = FfmpegVideoFrame::empty();
-            let mut scaler = None;
-
-            loop {
-                crossbeam::select! {
-                    recv(seek_rx_video) -> _cmd => {
-                        video_decoder.flush();
-                        // Drain the channel
-                        while video_packet_rx.try_recv().is_ok() {}
-                    }
-                    recv(video_packet_rx) -> packet => {
-                        match packet {
-                            Ok(packet) => {
-                                video_decoder.send_packet(&packet).unwrap();
-
-                                while video_decoder.receive_frame(&mut video_frame).is_ok() {
-                                    let frame = {
-                                        let mut rgb_frame = FfmpegVideoFrame::empty();
-                                        let scaler = if let Some(scaler) = &mut scaler {
-                                            scaler
-                                        } else {
-                                            let new_scaler = Context::get(
-                                                video_frame.format(),
-                                                video_frame.width(),
-                                                video_frame.height(),
-                                                ffmpeg::format::Pixel::RGBA,
-                                                video_frame.width(),
-                                                video_frame.height(),
-                                                Flags::BILINEAR,
-                                            )?;
-                                            scaler = Some(new_scaler);
-                                            scaler.as_mut().unwrap()
-                                        };
-
-                                        scaler.run(&video_frame, &mut rgb_frame)?;
-                                        rgb_frame
-                                    };
-
-                                    let frame_arc = Arc::new(frame);
-                                    frame_tx.send((
-                                        frame_arc.timestamp().unwrap_or(0),
-                                        frame_arc,
-                                    )).unwrap();
-
-                                    ctx.request_repaint();
-                                }
-                            }
-                            Err(_) => return Ok(()),
-                        }
-                    }
-                }
-            }
-        });
-
-        std::thread::spawn(move || -> anyhow::Result<()> {
-            loop {
-                crossbeam::select! {
-                    recv(seek_rx) -> cmd => {
-                        match cmd {
-                            Ok(cmd) => {
-                                ictx.seek(cmd, cmd..).unwrap();
-                            },
                             Err(e) => {
-                                tracing::error!("{e}");
+                                tracing::error!("ERROR: {e}");
+                                return;
                             },
-                        }
-                    }
-                    default => {
-                        for (stream, packet) in ictx.packets() {
-                            if stream.index() == video_stream_index {
-                                video_packet_tx.send(packet)?;
-                            } else if stream.index() == audio_stream_index {
-                                audio_packet_tx.send(packet)?;
-                            }
                         }
                     }
                 }
             }
         });
-    } else {
-        std::thread::spawn(move || -> anyhow::Result<()> {
-            let mut video_decoder = video_decoder;
-            let mut video_frame = FfmpegVideoFrame::empty();
-            let mut scaler = None;
 
-            loop {
-                crossbeam::select! {
-                    recv(seek_rx) -> cmd => {
-                        match cmd {
-                            Ok(cmd) => {
-                                ictx.seek(cmd, cmd..).unwrap();
-                                video_decoder.flush();
-                            },
-                            Err(e) => {
-                                tracing::error!("{e}");
-                            },
-                        }
-                    }
-                    default => {
-                        match ictx.packets().next() {
-                            Some((stream, packet)) => {
-                                if stream.index() == video_stream_index {
-                                    video_decoder.send_packet(&packet).unwrap();
+        std::thread::spawn(move || {
+            let thread = move || -> anyhow::Result<()> {
+                let mut video_decoder = video_decoder;
+                let mut video_frame = FfmpegVideoFrame::empty();
+                let mut scaler = None;
+
+                loop {
+                    crossbeam::select! {
+                        // recv(seek_rx_video) -> _cmd => {
+                        //     video_decoder.flush();
+                        //     // Drain the channel
+                        //     while video_packet_rx.try_recv().is_ok() {}
+                        // }
+                        recv(video_packet_rx) -> packet => {
+                            match packet {
+                                Ok(packet) => {
+                                    if let Err(e) = video_decoder.send_packet(&packet) {
+                                        tracing::error!("Failed to send packet to video decoder: {e}");
+                                        continue;
+                                    }
 
                                     while video_decoder.receive_frame(&mut video_frame).is_ok() {
                                         let frame = {
@@ -582,14 +468,121 @@ pub fn spawn_decoder(
                                             };
 
                                             scaler.run(&video_frame, &mut rgb_frame)?;
+                                            rgb_frame.set_pts(video_frame.timestamp());
                                             rgb_frame
                                         };
 
                                         let frame_arc = Arc::new(frame);
+
+                                        frame_tx_video.send((
+                                            frame_arc.pts().unwrap_or(0),
+                                            FfmpegFrame::Video(frame_arc),
+                                        ))?;
+                                    }
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+                    }
+                }
+            };
+
+            if let Err(e) = thread() {
+                tracing::error!("video thread: {e}");
+            }
+        });
+
+        std::thread::spawn(move || {
+            let mut thread = move || -> anyhow::Result<()> {
+                loop {
+                    crossbeam::select! {
+                        recv(seek_rx) -> cmd => {
+                            match cmd {
+                                Ok(cmd) => {
+                                    ictx.seek(cmd, cmd..)?;
+                                },
+                                Err(e) => {
+                                    tracing::error!("{e}");
+                                },
+                            }
+                        }
+                        default => {
+                            for (stream, packet) in ictx.packets() {
+                                if stream.index() == video_stream_index {
+                                    if let Err(e) = video_packet_tx.send(packet) {
+                                        tracing::error!("video packet channel: {e}");
+                                    }
+                                } else if stream.index() == audio_stream_index {
+                                    audio_packet_tx.send(packet)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            if let Err(e) = thread() {
+                tracing::error!("ERROR: decoder thread: {e}");
+            }
+        });
+    } else {
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            let mut video_decoder = video_decoder;
+            let mut video_frame = FfmpegVideoFrame::empty();
+            let mut scaler = None;
+
+            loop {
+                crossbeam::select! {
+                    recv(seek_rx) -> cmd => {
+                        match cmd {
+                            Ok(cmd) => {
+                                ictx.seek(cmd, cmd..)?;
+                                video_decoder.flush();
+                            },
+                            Err(e) => {
+                                tracing::error!("{e}");
+                            },
+                        }
+                    }
+                    default => {
+                        match ictx.packets().next() {
+                            Some((stream, packet)) => {
+                                if stream.index() == video_stream_index {
+                                    if let Err(e) = video_decoder.send_packet(&packet) {
+                                        tracing::error!("Failed to send packet to video decoder: {e}");
+                                        continue;
+                                    }
+
+                                    while video_decoder.receive_frame(&mut video_frame).is_ok() {
+                                        let frame = {
+                                            let mut rgb_frame = FfmpegVideoFrame::empty();
+                                            let scaler = if let Some(scaler) = &mut scaler {
+                                                scaler
+                                            } else {
+                                                let new_scaler = Context::get(
+                                                    video_frame.format(),
+                                                    video_frame.width(),
+                                                    video_frame.height(),
+                                                    ffmpeg::format::Pixel::RGBA,
+                                                    video_frame.width(),
+                                                    video_frame.height(),
+                                                    Flags::BILINEAR,
+                                                )?;
+                                                scaler = Some(new_scaler);
+                                                scaler.as_mut().unwrap()
+                                            };
+
+                                            scaler.run(&video_frame, &mut rgb_frame)?;
+                                            rgb_frame.set_pts(video_frame.timestamp());
+                                            rgb_frame
+                                        };
+
+                                        let frame_arc = Arc::new(frame);
+
                                         frame_tx.send((
-                                            frame_arc.timestamp().unwrap_or(0),
-                                            frame_arc,
-                                        )).unwrap();
+                                            frame_arc.pts().unwrap_or(0),
+                                            FfmpegFrame::Video(frame_arc),
+                                        ))?;
 
                                         ctx.request_repaint();
                                     }

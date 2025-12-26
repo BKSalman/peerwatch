@@ -31,9 +31,15 @@ impl AudioDecoder {
         self.decoder.flush();
     }
 
-    pub fn pop_samples(&mut self) -> anyhow::Result<Option<&[f32]>> {
+    pub fn time_base(&self) -> f64 {
+        f64::from(self.decoder.time_base())
+    }
+
+    pub fn pop_frame(&mut self) -> anyhow::Result<Option<(FfmpegAudioFrame, Option<i64>)>> {
         match self.decoder.receive_frame(&mut self.decoded_frame) {
             Ok(()) => {
+                let pts = self.decoded_frame.timestamp();
+
                 let resampler = if let Some(resampler) = &mut self.resampler {
                     resampler
                 } else {
@@ -62,11 +68,7 @@ impl AudioDecoder {
                     .run(&self.decoded_frame, &mut self.resampled_frame)
                     .unwrap();
 
-                let frame = &self.resampled_frame;
-                let expected_bytes =
-                    frame.samples() * frame.channels() as usize * core::mem::size_of::<f32>();
-
-                Ok(Some(bytemuck::cast_slice(&frame.data(0)[..expected_bytes])))
+                Ok(Some((self.resampled_frame.clone(), pts)))
             }
             Err(ffmpeg::Error::Eof) => Ok(None),
             Err(ffmpeg::Error::Other { errno: 11 }) => Ok(None), // EAGAIN - need more input
